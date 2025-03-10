@@ -1,0 +1,12 @@
+torch
+torch_geometric
+torchvision
+torchaudio
+torch-cluster
+torch-scatter
+torch-sparse
+torch-spline-conv
+matplotlib
+seaborn
+scikit-learn
+tqdm
