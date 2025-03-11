@@ -1,240 +1,298 @@
-import os
 import time
 import torch
 import torch.nn.functional as F
-import torch_geometric
-from torch_geometric.loader import DataLoader
+from torch.utils.data import IterableDataset, DataLoader
 import matplotlib.pyplot as plt
+import psutil
+import numpy as np
 import seaborn as sns
-from sklearn.metrics import confusion_matrix, classification_report, precision_score, recall_score, f1_score
+from sklearn.metrics import confusion_matrix, roc_auc_score, roc_curve, classification_report
 from particlenet import ParticleNet
 from args import Args
 from tqdm import tqdm
+from torch_geometric.data import Batch, Data
 
-# Initialiser args og device
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+if torch.cuda.is_available():
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.benchmark = True
+    scaler = torch.cuda.amp.GradScaler()
+
 args = Args()
-DEVICE = args.device
 
+class StreamingDataset(IterableDataset):
+    def __init__(self, dataset_path, indices):
+        super().__init__()
+        self.dataset_path = dataset_path
+        self.indices = indices
 
-# Dataset-definisjon – bruk weights_only=False
-class ProcessedDataset(torch_geometric.data.InMemoryDataset):
-    def __init__(self, dataset_path):
-        super().__init__(dataset_path)
-        self.data, self.slices = torch.load(os.path.join(dataset_path, "processed", "data.pt"), weights_only=False)
+    def __iter__(self):
+        data, slices = torch.load(self.dataset_path, weights_only=False)
+        for idx in self.indices:
+            start_idx = slices["x"][idx]
+            end_idx   = slices["x"][idx+1]
+            yield Data(
+                x=data.x[start_idx:end_idx],
+                y=data.y[idx],
+                pos=data.pos[start_idx:end_idx]
+            )
 
-    @property
-    def processed_file_names(self):
-        return ["data.pt"]
+def collate_fn(batch):
+    return Batch.from_data_list(batch)
 
+def fpr_at_90_recall(y_true, y_scores):
+    fpr, tpr, _ = roc_curve(y_true, y_scores)
+    idx = np.where(tpr >= 0.90)[0][0]
+    return fpr[idx] if idx < len(fpr) else fpr[-1]
 
-# Treningsløkke med progress bar og ekstra metrikker
+@torch.no_grad()
+def measure_inference_latency(model, loader, num_samples=1000):
+    model.eval()
+    times = []
+    for count, batch in enumerate(loader):
+        if count >= num_samples:
+            break
+        batch = batch.to(DEVICE)
+        with torch.cuda.amp.autocast():
+            start = time.time()
+            _ = model(batch)
+            end   = time.time()
+        times.append(end - start)
+    if len(times) == 0:
+        return 0.0
+    return np.mean(times) * 1000.0
+
 def train_epoch(model, optimizer, train_loader, epoch):
     model.train()
-    total_loss = 0.0
-    total_correct = 0
-    total_samples = 0
-    all_train_preds = []
-    all_train_labels = []
-    start_time = time.time()
-    pbar = tqdm(train_loader, desc=f"Epoch {epoch}", leave=True)
-    for batch in pbar:
+    total_loss, total_correct, total_samples = 0.0, 0, 0
+
+    pbar = tqdm(
+        train_loader,
+        desc=f"Epoch {epoch}",
+        leave=True,
+        total=TRAIN_BATCHES_TOTAL
+    )
+
+    for i, batch in enumerate(pbar):
         batch = batch.to(DEVICE)
+        batch.x = batch.x.to(torch.float16)  # ✅ Kun x til FP16
+        batch.pos = batch.pos.to(torch.float16)  # ✅ Konverter pos også om nødvendig
+
         optimizer.zero_grad()
-        outputs = model(batch)
-        targets = batch.y.long()
-        loss = F.cross_entropy(outputs, targets)
-        loss.backward()
-        optimizer.step()
 
-        batch_size = targets.size(0)
-        total_loss += loss.item() * batch_size
-        preds = outputs.argmax(dim=1)
-        total_correct += (preds == targets).sum().item()
-        total_samples += batch_size
+        with torch.amp.autocast(device_type="cuda"):
+            outputs = model(batch)
+            targets = batch.y.long()  # ✅ Sørg for at labels forblir int64
+            loss = F.cross_entropy(outputs, targets)
 
-        # Akkumuler for metrikker
-        all_train_preds.extend(preds.cpu().numpy())
-        all_train_labels.extend(targets.cpu().numpy())
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
+
+        bs = targets.size(0)
+        total_loss += loss.item() * bs
+        total_correct += (outputs.argmax(dim=1) == targets).sum().item()
+        total_samples += bs
 
         cur_loss = total_loss / total_samples
-        cur_acc = total_correct / total_samples
-        current_iter = pbar.n
-        total_iter = len(train_loader)
-        elapsed = time.time() - start_time
-        avg_iter_time = elapsed / (current_iter if current_iter else 1)
-        rem_time = (total_iter - current_iter) * avg_iter_time
+        cur_acc  = total_correct / total_samples
+        pbar.set_postfix(loss=f"{cur_loss:.4f}", acc=f"{cur_acc:.4f}")
 
-        pbar.set_postfix(loss=f"{cur_loss:.4f}", acc=f"{cur_acc:.4f}", rem_time=f"{rem_time:.2f}s")
-    epoch_time = time.time() - start_time
-    throughput = total_samples / epoch_time
+        if i + 1 >= TRAIN_BATCHES_TOTAL:
+            break
 
-    # Beregn ekstra metrikker
-    precision = precision_score(all_train_labels, all_train_preds, average="macro")
-    recall = recall_score(all_train_labels, all_train_preds, average="macro")
-    f1 = f1_score(all_train_labels, all_train_preds, average="macro")
-
-    print(
-        f"Epoch {epoch} - Loss: {cur_loss:.4f}, Acc: {cur_acc:.4f}, Prec: {precision:.4f}, Rec: {recall:.4f}, F1: {f1:.4f}, Time: {epoch_time:.2f}s, Throughput: {throughput:.2f} samples/s")
-    return cur_loss, cur_acc
+    return total_loss / total_samples, total_correct / total_samples
 
 
-# Valideringsløkke med progress bar og ekstra metrikker
-def validate_epoch(model, val_loader, epoch):
+def validate_epoch(model, loader, epoch_str="Val", is_val=True):
     model.eval()
-    total_loss = 0.0
-    total_correct = 0
-    total_samples = 0
-    all_val_preds = []
-    all_val_labels = []
-    start_time = time.time()
-    pbar = tqdm(val_loader, desc=f"Validation Epoch {epoch}", leave=True)
+    total_loss, total_correct, total_samples = 0.0, 0, 0
+    all_preds, all_labels, all_probs = [], [], []
+
+    # Hardkodet total for tqdm
+    total_steps = VAL_BATCHES_TOTAL if is_val else TEST_BATCHES_TOTAL
+    pbar = tqdm(loader, desc=f"{epoch_str}", leave=True, total=total_steps)
+
     with torch.no_grad():
-        for batch in pbar:
+        for i, batch in enumerate(pbar):
             batch = batch.to(DEVICE)
-            outputs = model(batch)
+            with torch.cuda.amp.autocast():
+                out = model(batch)
             targets = batch.y.long()
-            loss = F.cross_entropy(outputs, targets)
-            batch_size = targets.size(0)
-            total_loss += loss.item() * batch_size
-            preds = outputs.argmax(dim=1)
+            loss = F.cross_entropy(out, targets)
+
+            preds = out.argmax(dim=1)
+            probs = torch.softmax(out, dim=1)[:, 1].cpu().numpy()
+
+            bs = targets.size(0)
+            total_loss    += loss.item() * bs
             total_correct += (preds == targets).sum().item()
-            total_samples += batch_size
+            total_samples += bs
 
-            # Akkumuler for metrikker
-            all_val_preds.extend(preds.cpu().numpy())
-            all_val_labels.extend(targets.cpu().numpy())
-
-            cur_loss = total_loss / total_samples
-            cur_acc = total_correct / total_samples
-            current_iter = pbar.n
-            total_iter = len(val_loader)
-            elapsed = time.time() - start_time
-            avg_iter_time = elapsed / (current_iter if current_iter else 1)
-            rem_time = (total_iter - current_iter) * avg_iter_time
-
-            pbar.set_postfix(loss=f"{cur_loss:.4f}", acc=f"{cur_acc:.4f}", rem_time=f"{rem_time:.2f}s")
-    epoch_time = time.time() - start_time
-
-    # Beregn ekstra metrikker
-    precision = precision_score(all_val_labels, all_val_preds, average="macro")
-    recall = recall_score(all_val_labels, all_val_preds, average="macro")
-    f1 = f1_score(all_val_labels, all_val_preds, average="macro")
-
-    print(
-        f"Epoch {epoch} - Val Loss: {cur_loss:.4f}, Val Acc: {cur_acc:.4f}, Prec: {precision:.4f}, Rec: {recall:.4f}, F1: {f1:.4f}, Time: {epoch_time:.2f}s")
-    return cur_loss, cur_acc
-
-
-# Testløkke med progress bar og ekstra metrikker
-def test_model(model, test_loader):
-    model.eval()
-    total_loss = 0.0
-    total_correct = 0
-    total_samples = 0
-    all_preds = []
-    all_labels = []
-    start_time = time.time()
-    pbar = tqdm(test_loader, desc="Testing", leave=True)
-    with torch.no_grad():
-        for batch in pbar:
-            batch = batch.to(DEVICE)
-            outputs = model(batch)
-            targets = batch.y.long()
-            loss = F.cross_entropy(outputs, targets)
-            batch_size = targets.size(0)
-            total_loss += loss.item() * batch_size
-            preds = outputs.argmax(dim=1)
-            total_correct += (preds == targets).sum().item()
-            total_samples += batch_size
             all_preds.extend(preds.cpu().numpy())
             all_labels.extend(targets.cpu().numpy())
-    epoch_time = time.time() - start_time
-    avg_loss = total_loss / total_samples
-    avg_acc = total_correct / total_samples
+            all_probs.extend(probs)
 
-    # Ekstra metrikker
-    precision = precision_score(all_labels, all_preds, average="macro")
-    recall = recall_score(all_labels, all_preds, average="macro")
-    f1 = f1_score(all_labels, all_preds, average="macro")
+            cur_loss = total_loss / total_samples
+            cur_acc  = total_correct / total_samples
+            pbar.set_postfix(loss=f"{cur_loss:.4f}", acc=f"{cur_acc:.4f}")
 
-    print(
-        f"Test - Loss: {avg_loss:.4f}, Acc: {avg_acc:.4f}, Prec: {precision:.4f}, Rec: {recall:.4f}, F1: {f1:.4f}, Time: {epoch_time:.2f}s")
-    return avg_loss, avg_acc, all_preds, all_labels
+            if i+1 >= total_steps:
+                break
+
+    roc_auc = roc_auc_score(all_labels, all_probs) if len(set(all_labels))>1 else float('nan')
+    fpr90   = fpr_at_90_recall(all_labels, all_probs)
+    return total_loss / total_samples, total_correct / total_samples, roc_auc, fpr90
+
+@torch.no_grad()
+def permutation_feature_importance(model, loader, input_dim, n_perm=3):
+    model.eval()
+    baseline_acc = validate_epoch(model, loader, epoch_str="Baseline", is_val=False)[1]
+    importances = np.zeros(input_dim, dtype=np.float32)
+
+    for feat_idx in range(input_dim):
+        results = []
+        for _ in range(n_perm):
+            for batch in loader:
+                batch = batch.to(DEVICE)
+                batch.x = batch.x.to(torch.float16)  # ✅ Kun x til FP16
+                batch.pos = batch.pos.to(torch.float16)  # ✅ Hvis nødvendig
+
+                original_vals = batch.x[:, feat_idx].clone()
+                permuted_vals = original_vals[torch.randperm(len(original_vals))]
+                batch.x[:, feat_idx] = permuted_vals
+
+                perm_acc = validate_epoch(model, [batch], epoch_str="PermTest", is_val=False)[1]
+                results.append(baseline_acc - perm_acc)
+                batch.x[:, feat_idx] = original_vals  # Reset
+
+        importances[feat_idx] = float(np.mean(results))
+        print(f"Feature {feat_idx:2d} => importance={importances[feat_idx]:.4f}")
+
+    return importances
+
 
 
 if __name__ == "__main__":
-    os.makedirs(os.path.join(args.output_dir, "checkpoints"), exist_ok=True)
 
-    train_dataset = ProcessedDataset(os.path.join(args.output_dir, "train"))
-    val_dataset = ProcessedDataset(os.path.join(args.output_dir, "val"))
-    test_dataset = ProcessedDataset(os.path.join(args.output_dir, "test"))
+    # 🔹 **Optimaliseringer for A100**
+    DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if torch.cuda.is_available():
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.benchmark = True
+        scaler = torch.cuda.amp.GradScaler()
 
-    train_loader = DataLoader(train_dataset, num_workers=4, batch_size=args.batch_size, shuffle=True, drop_last=True,
-                              persistent_workers=True)
-    val_loader = DataLoader(val_dataset, num_workers=4, batch_size=args.batch_size, shuffle=False, drop_last=False,
-                            persistent_workers=True)
-    test_loader = DataLoader(test_dataset, num_workers=4, batch_size=args.batch_size, shuffle=False, drop_last=False,
-                             persistent_workers=True)
+    args = Args()
 
+    # 🔹 **Lese metadata fra `data.pt`**
+    print("📥 Leser `data.pt` for å hente metadata...")
+    data, slices = torch.load("data.pt", weights_only=False)
+    n_total = len(data.y)
+    print(f"📊 Dataset har {n_total} jets og {data.x.shape[0]} partikler.")
+
+    # 🔹 **Splitt dataset (80-10-10)**
+    torch.manual_seed(42)
+    idx = torch.randperm(n_total)
+
+    n_train = int(0.8 * n_total)
+    n_val = int(0.1 * n_total)
+    n_test = n_total - n_train - n_val
+
+    train_loader = DataLoader(StreamingDataset("data.pt", idx[:n_train]), batch_size=args.batch_size, num_workers=0, collate_fn=collate_fn, pin_memory=True)
+    val_loader   = DataLoader(StreamingDataset("data.pt", idx[n_train:n_train + n_val]), batch_size=args.batch_size, num_workers=8, collate_fn=collate_fn, pin_memory=True)
+    test_loader  = DataLoader(StreamingDataset("data.pt", idx[n_train + n_val:]), batch_size=args.batch_size, num_workers=8, collate_fn=collate_fn, pin_memory=True)
+
+    # 🔹 **Opprett ParticleNet-modell**
+    print("🚀 Oppretter ParticleNet-modell...")
     model = ParticleNet({
-        "conv_params": args.conv_params,
-        "fc_params": args.fc_params,
         "input_features": args.input_features,
         "output_classes": args.output_classes,
+        "conv_params": args.conv_params,
+        "fc_params": args.fc_params,
     }).to(DEVICE)
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate)
+    model = torch.compile(model)  # ✅ Optimaliser for A100
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, fused=True)  # ✅ Fused AdamW
+
+    # 🔹 **Sett faste antall batches**
+    TRAIN_BATCHES_TOTAL = 12500
+    VAL_BATCHES_TOTAL   = 1562
+    TEST_BATCHES_TOTAL  = 1562
 
     best_val_loss = float('inf')
-    best_epoch = -1
-    num_epochs = args.epochs
+    best_epoch    = -1
 
-    for epoch in range(num_epochs):
+    for epoch in range(args.epochs):
         train_loss, train_acc = train_epoch(model, optimizer, train_loader, epoch)
-        val_loss, val_acc = validate_epoch(model, val_loader, epoch)
+        val_loss, val_acc, val_roc, val_fpr90 = validate_epoch(model, val_loader, epoch_str=f"Val epoch={epoch}", is_val=True)
 
-        # Lagre sjekkpunkt hvis val_loss forbedres
+        # **Lagre best modell basert på valideringstap**
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             best_epoch = epoch
-            checkpoint_path = os.path.join(args.output_dir, "checkpoints", f"best_model_epoch_{epoch}.pt")
-            torch.save({
-                "epoch": epoch,
-                "model_state_dict": model.state_dict(),
-                "optimizer_state_dict": optimizer.state_dict(),
-                "val_loss": val_loss,
-            }, checkpoint_path)
-            print(f"Checkpoint lagret ved epoch {epoch} med val_loss: {val_loss:.4f}")
+            torch.save({"model_state_dict": model.state_dict()}, "best_model.pt")
+            print(f"🔹 Lagret checkpoint ved epoch {epoch}")
 
-    print("Testing på testsett...")
-    test_loss, test_acc, all_preds, all_labels = test_model(model, test_loader)
-
-    # Last beste modell for endelig evaluering
-    best_checkpoint_path = os.path.join(args.output_dir, "checkpoints", f"best_model_epoch_{best_epoch}.pt")
-    checkpoint = torch.load(best_checkpoint_path, map_location=DEVICE)
-    model.load_state_dict(checkpoint["model_state_dict"])
+    # 🔹 **Last beste modell**
+    print(f"📥 Laster beste checkpoint fra epoch {best_epoch}")
+    model.load_state_dict(torch.load("best_model.pt")["model_state_dict"])
     model.to(DEVICE)
-    model.eval()
-    _, _, all_preds, all_labels = test_model(model, test_loader)
 
-    # Confusion matrix og klassifikasjonsrapport
-    conf_matrix = confusion_matrix(all_labels, all_preds)
-    plt.figure(figsize=(8, 6))
-    sns.heatmap(conf_matrix, annot=True, fmt="d", cmap="Blues",
-                xticklabels=list(map(str, range(args.output_classes))),
-                yticklabels=list(map(str, range(args.output_classes))))
+    # 🔹 **Endelig test på test-settet**
+    print("📊 **Endelig evaluering på test-sett**")
+    final_loss, final_acc, final_roc, final_fpr90 = validate_epoch(model, test_loader, epoch_str="FinalTest", is_val=False)
+    print(f"Test => Loss={final_loss:.4f}, Acc={final_acc:.4f}, ROC={final_roc:.4f}, FPR90={final_fpr90:.4f}")
+
+    # 🔹 **Inference Latency**
+    latency = measure_inference_latency(model, test_loader)
+    print(f"🕒 Inference-latency per batch ~ {latency:.3f} ms")
+
+    # 🔹 **Memory Usage**
+    memory_usage = psutil.virtual_memory().used / 1e9
+    print(f"💾 Memory usage ~ {memory_usage:.2f} GB")
+
+    # 🔹 **Confusion Matrix**
+    print("📊 Genererer Confusion Matrix...")
+    all_preds, all_labels = [], []
+    with torch.no_grad():
+        for batch in test_loader:
+            batch = batch.to(DEVICE)
+            with torch.cuda.amp.autocast():
+                out = model(batch)
+            preds = out.argmax(dim=1)
+            all_preds.extend(preds.cpu().numpy())
+            all_labels.extend(batch.y.cpu().numpy())
+
+    cm = confusion_matrix(all_labels, all_preds)
+    plt.figure(figsize=(6, 5))
+    sns.heatmap(cm, annot=True, fmt="d", cmap="Blues")
     plt.xlabel("Predicted")
     plt.ylabel("True")
     plt.title("Confusion Matrix")
-    plt.savefig(os.path.join(args.output_dir, "confusion_matrix.png"))
+    plt.savefig("confusion_matrix.png")
     plt.show()
 
+    # 🔹 **Klassifikasjonsrapport**
+    print("📊 Klassifikasjonsrapport:")
     print(classification_report(all_labels, all_preds, digits=4))
 
-    # Feature importance (gjennomsnittlig absoluttverdi av input_bn.weight)
-    feature_importance = torch.mean(torch.abs(model.input_bn.weight)).cpu().numpy()
-    print(f"Feature Importance: {feature_importance}")
-    with open(os.path.join(args.output_dir, "feature_importance.txt"), "w") as f:
-        f.write(f"Feature Importance: {feature_importance}\n")
+    # 🔹 **Permutasjonsbasert Feature Importance**
+    print("📊 **Kjører Permutasjonsbasert Feature Importance**")
+    importances = permutation_feature_importance(
+        model, test_loader,
+        input_dim=args.input_features,
+        n_perm=3
+    )
+    print("Permutation-based importances:\n", importances)
 
-    print("✅ Treningsprosess fullført!")
+    # 🔹 **Lagre og plotte feature importance**
+    np.savetxt("permutation_importances.txt", importances, fmt="%.4f")
+    plt.figure(figsize=(7, 4))
+    plt.bar(range(len(importances)), importances)
+    plt.xlabel("Feature index")
+    plt.ylabel("Importance (Δ acc)")
+    plt.title("Permutation-based Feature Importances")
+    plt.savefig("permutation_importances.png")
+    plt.show()
+
+    print("✅ **Fullført!**")

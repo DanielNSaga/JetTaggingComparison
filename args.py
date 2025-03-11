@@ -22,12 +22,4 @@ class Args:
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.output_dir = "output"
 
-        # ✅ Dataset-baner
-        self.train_jets = "data/converted/training.parquet"
-        self.train_labels = "data/converted/training_labels.parquet"
 
-        self.val_jets = "data/converted/validation.parquet"
-        self.val_labels = "data/converted/validation_labels.parquet"
-
-        self.test_jets = "data/converted/test.parquet"
-        self.test_labels = "data/converted/test_labels.parquet"
