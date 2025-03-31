@@ -48,9 +48,6 @@ class Trainer:
         self.cfg = cfg
         self.device = torch.device(cfg.device)
         self.model = ParticleNet(cfg.input_dims, cfg.num_classes).to(self.device)
-        if hasattr(torch, "compile"):
-            if torch.device("cuda"):
-                self.model = torch.compile(self.model)
 
         self.optimizer = optim.Adam(self.model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
         self.criterion = nn.BCEWithLogitsLoss()
@@ -100,29 +97,41 @@ class Trainer:
         """
         self.model.train()
         total_loss, correct, total = 0, 0, 0
-        for batch in tqdm(self.train_loader, desc=f"Train {epoch}", leave=False):
-            X, y = batch["X"], batch["y"]
-            points = self._to_tensor(X["points"]).float().to(self.device)
-            features = self._to_tensor(X["features"]).float().to(self.device)
-            mask = (features.abs().sum(dim=2, keepdim=True) != 0).float()
-            labels = self._to_tensor(y).float().to(self.device)
 
-            self.optimizer.zero_grad()
-            with torch.amp.autocast(device_type=self.cfg.device):
-                outputs = self.model(points, features, mask)
-                loss = self.criterion(outputs, labels)
+        with tqdm(self.train_loader, desc=f"Train {epoch}", leave=False) as pbar:
+            for batch in pbar:
+                X, y = batch["X"], batch["y"]
+                points = self._to_tensor(X["points"]).float().to(self.device)
+                features = self._to_tensor(X["features"]).float().to(self.device)
+                mask = (features.abs().sum(dim=2, keepdim=True) != 0).float()
+                labels = self._to_tensor(y).float().to(self.device)
 
-            self.scaler.scale(loss).backward()
-            self.scaler.step(self.optimizer)
-            self.scaler.update()
+                self.optimizer.zero_grad()
+                with torch.amp.autocast(device_type=self.cfg.device):
+                    outputs = self.model(points, features, mask)
+                    loss = self.criterion(outputs, labels)
 
-            total_loss += loss.item() * labels.size(0)
-            preds = outputs.argmax(dim=1)
-            targets = labels.argmax(dim=1)
-            correct += (preds == targets).sum().item()
-            total += labels.size(0)
+                self.scaler.scale(loss).backward()
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
 
-        return total_loss / total, correct / total
+                total_loss += loss.item() * labels.size(0)
+                preds = outputs.argmax(dim=1)
+                targets = labels.argmax(dim=1)
+                correct += (preds == targets).sum().item()
+                total += labels.size(0)
+
+
+                running_loss = total_loss / total
+                running_acc = correct / total
+                pbar.set_postfix({
+                    "loss": f"{running_loss:.4f}",
+                    "acc": f"{running_acc:.4f}"
+                })
+
+        epoch_loss = total_loss / total
+        epoch_acc = correct / total
+        return epoch_loss, epoch_acc
 
     def validate(self, epoch):
         """

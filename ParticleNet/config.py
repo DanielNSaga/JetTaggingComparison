@@ -51,7 +51,7 @@ class Config:
         log_dir (str): Path to log directory for TensorBoard and saved models.
     """
     # Model
-    input_dims: int = 4
+    input_dims: int = 11
     num_classes: int = 10
     pad_len: int = 128
     stream: bool = True
@@ -66,7 +66,7 @@ class Config:
     num_workers: int = 8
 
     # Training
-    epochs: int = 30
+    epochs: int = 10
     lr: float = 1e-3
     min_lr: float = 1e-5
     weight_decay: float = 1e-4

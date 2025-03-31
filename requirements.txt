@@ -1,0 +1,12 @@
+torch>=2.0.0
+numpy>=1.22
+h5py>=3.8
+matplotlib>=3.5
+seaborn>=0.11
+scikit-learn>=1.0
+tqdm>=4.60
+requests>=2.25
+uproot>=5.0
+scipy>=1.7
+jax>=0.4.0
+jaxlib>=0.4.0

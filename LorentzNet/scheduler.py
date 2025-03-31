@@ -41,7 +41,7 @@ class CosineWithWarmupScheduler:
 
         # Fallback scheduler in case of plateau
         self.lr_plateau = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, mode='min', factor=0.5, patience=3, min_lr=min_lr, verbose=False
+            optimizer, mode='min', factor=0.5, patience=3, min_lr=min_lr
         )
 
         self.history = []  # Store LR per epoch for plotting

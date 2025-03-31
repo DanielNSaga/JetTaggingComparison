@@ -40,7 +40,7 @@ class Config:
                               'warmup_cosine', 'cosine', 'step', 'plateau', 'none'
     """
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
-    epochs: int = 30
+    epochs: int = 10
     batch_size: int = 64
     num_workers: int = 8
     lr: float = 1e-3

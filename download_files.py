@@ -9,10 +9,7 @@ The archive contains a folder with ROOT files.
 Adapted from: https://github.com/jet-universe/particle_transformer/blob/main/get_datasets.py
 
 Usage:
-    python download_files.py [--force]
-
-Options:
-    --force     Force re-download even if the file already exists.
+    python download_files.py
 """
 
 import argparse

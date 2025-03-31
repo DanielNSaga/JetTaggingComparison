@@ -1,65 +1,41 @@
-"""
-Convert ROOT files to HDF5 format for JetClass dataset
-
-This script reads ROOT files containing jet and particle-level information,
-processes the data, and saves it in an HDF5 format with fixed dimensions.
-
-The conversion ensures that:
-- All particle arrays are padded to a fixed number of particles (`fixed_nvectors`).
-- Additional metadata, such as particle masses, one-hot encoded PID labels, and transverse momenta, is computed.
-- The dataset is split into balanced training, validation, and test sets.
-
-Adapted from:
-https://github.com/fizisist/LorentzGroupNetwork/blob/master/data/toptag/conversion/raw2h5/utils/condor/raw2h5.py
-"""
-
-import os
-import glob
-import time
+import os, glob, time
 import numpy as np
 import h5py
 import uproot
-from numba import jit
-
-
-##########################################
-# Lorentz-invariant functions           #
-##########################################
+import jax.numpy as jnp
+from jax import jit
 
 @jit
 def dot(p1, p2):
-    """Computes the Lorentz-invariant dot product of two 4-momentum vectors."""
-    return p1[0] * p2[0] - np.dot(p1[1:], p2[1:])
-
+    """Lorentz-invariant dot product for two 4-vectors."""
+    return p1[0] * p2[0] - jnp.dot(p1[1:], p2[1:])
 
 @jit
 def dots(p1s, p2s):
-    """Computes the Lorentz-invariant dot product for multiple 4-momentum vectors."""
-    return np.array([dot(p1s[i], p2s[i]) for i in range(p1s.shape[0])])
-
+    """Lorentz-invariant dot product for batches of 4-vectors."""
+    return jnp.array([dot(p1s[i], p2s[i]) for i in range(p1s.shape[0])])
 
 @jit
 def masses(p):
-    """Computes the invariant mass of a set of 4-momentum vectors."""
-    return np.sqrt(np.maximum(0., dots(p, p)))
-
+    """Compute invariant mass for a batch of 4-vectors."""
+    return jnp.sqrt(jnp.maximum(0., dots(p, p)))
 
 @jit
 def pt(momentum):
-    """Computes the transverse momentum (pT) of a momentum vector."""
-    return np.sqrt(np.dot(momentum[1:3], momentum[1:3]))
+    """Compute transverse momentum from 4-vector."""
+    return jnp.sqrt(jnp.dot(momentum[1:3], momentum[1:3]))
 
 
-##########################################
-# One-hot encoding for PID flags        #
-##########################################
+# ================================
+# One-hot PID encoding
+# ================================
 
 def one_hot_pid(charged, neutral, photon, electron, muon):
     """
-    Returns a one-hot vector with 5 components based on PID flags.
-    Assumes that only one flag is set per particle.
+    One-hot encode particle type using PID flags.
 
-    Order: [chargedHadron, neutralHadron, photon, electron, muon]
+    Returns:
+        np.ndarray: 5-dimensional one-hot vector.
     """
     vec = np.zeros(5, dtype=np.float64)
     if charged == 1:
@@ -75,30 +51,30 @@ def one_hot_pid(charged, neutral, photon, electron, muon):
     return vec
 
 
-##########################################
-# ROOT file conversion functions        #
-##########################################
+# ================================
+# ROOT to dictionary conversion
+# ================================
 
-def convert_root_to_dict(root_file, fixed_nvectors, double_precision=True):
+def convert_root_to_dict(root_file, fixed_nvectors, add_beams=False, dot_products=False, double_precision=True):
     """
-    Converts a ROOT file to a structured dictionary with fixed dimensions.
-    All arrays are padded to `fixed_nvectors`.
+    Convert a ROOT file to structured dictionary with fixed-sized arrays.
 
     Args:
-        root_file (str): Path to the ROOT file.
-        fixed_nvectors (int): Fixed number of particles per jet.
-        double_precision (bool): Whether to store data in double precision (float64).
+        root_file (str): Path to ROOT file.
+        fixed_nvectors (int): Number of particles to pad/truncate to.
+        add_beams (bool): Whether to add beam particles.
+        dot_products (bool): Whether to compute pairwise dot products.
+        double_precision (bool): Use float64 if True, else float32.
 
     Returns:
-        dict: A dictionary containing jet and particle-level information.
+        dict: structured data for the file.
     """
     precision = 'f8' if double_precision else 'f4'
     file = uproot.open(root_file)
     tree = file["tree"]
     branches = [
         "part_energy", "part_px", "part_py", "part_pz",
-        "jet_nparticles",
-        "part_charge",
+        "jet_nparticles", "part_charge",
         "part_isChargedHadron", "part_isNeutralHadron", "part_isPhoton",
         "part_isElectron", "part_isMuon",
         "label_QCD", "label_Hbb", "label_Hcc", "label_Hgg",
@@ -107,91 +83,153 @@ def convert_root_to_dict(root_file, fixed_nvectors, double_precision=True):
     ]
     data = tree.arrays(branches, library="np")
     nentries = len(data["jet_nparticles"])
+    nbeam = 2 if add_beams else 0
+    nvectors = fixed_nvectors
 
     out = {
         "Nobj": np.zeros(nentries, dtype=np.int16),
-        "Pmu": np.zeros((nentries, fixed_nvectors, 4), dtype=precision),
-        "mass": np.zeros((nentries, fixed_nvectors), dtype=precision),
+        "Pmu": np.zeros((nentries, nvectors, 4), dtype=precision),
+        "truth_Pmu": np.zeros((nentries, 4), dtype=precision),
+        "jet_pt": np.zeros(nentries, dtype=precision),
+        "label": np.zeros((nentries, nvectors), dtype=np.int16),
+        "mass": np.zeros((nentries, nvectors), dtype=precision),
         "jet_label": np.zeros((nentries, 10), dtype=np.int16),
-        "scalars": np.zeros((nentries, fixed_nvectors, 7), dtype=precision),
-        "atom_mask": np.zeros((nentries, fixed_nvectors), dtype=bool)
+        "scalars": np.zeros((nentries, nvectors, 7), dtype=precision),
+        "atom_mask": np.zeros((nentries, nvectors), dtype=bool)
     }
+    if dot_products:
+        out["dots"] = np.zeros((nentries, nvectors, nvectors), dtype=precision)
+
+    if add_beams:
+        beam_vec = np.array([[np.sqrt(1.), 0, 0, 1.], [np.sqrt(1.), 0, 0, -1.]], dtype=precision)
 
     for i in range(nentries):
         nobj = int(data["jet_nparticles"][i])
-        E = data["part_energy"][i][:nobj]
-        px = data["part_px"][i][:nobj]
-        py = data["part_py"][i][:nobj]
-        pz = data["part_pz"][i][:nobj]
+        E, px, py, pz = data["part_energy"][i][:nobj], data["part_px"][i][:nobj], data["part_py"][i][:nobj], data["part_pz"][i][:nobj]
         Pmu_event = np.stack([E, px, py, pz], axis=1)
-        out["Pmu"][i, :nobj, :] = Pmu_event
-        out["mass"][i, :nobj] = masses(Pmu_event)
 
+        out["Pmu"][i, :nobj, :] = Pmu_event
+        out["Nobj"][i] = nobj + nbeam
+        out["jet_pt"][i] = pt(np.sum(Pmu_event, axis=0))
+        out["label"][i, :nobj] = 1
+        out["mass"][i, :] = masses(out["Pmu"][i, :, :])
+        out["atom_mask"][i, :nobj] = True
+
+        m_vec = masses(Pmu_event)
         charge = data["part_charge"][i][:nobj]
-        pid_onehot = np.array([one_hot_pid(
-            data["part_isChargedHadron"][i][j],
-            data["part_isNeutralHadron"][i][j],
-            data["part_isPhoton"][i][j],
-            data["part_isElectron"][i][j],
-            data["part_isMuon"][i][j]
-        ) for j in range(nobj)])
-        scalars_event = np.concatenate([charge.reshape(-1, 1), pid_onehot], axis=1)
+        pid_onehot = np.array([
+            one_hot_pid(
+                data["part_isChargedHadron"][i][j],
+                data["part_isNeutralHadron"][i][j],
+                data["part_isPhoton"][i][j],
+                data["part_isElectron"][i][j],
+                data["part_isMuon"][i][j]
+            ) for j in range(nobj)
+        ])
+        scalars_event = np.concatenate([m_vec[:, None], charge[:, None], pid_onehot], axis=1)
         out["scalars"][i, :nobj, :] = scalars_event
 
-        mask = np.zeros(fixed_nvectors, dtype=bool)
-        mask[:nobj] = True
-        out["atom_mask"][i, :] = mask
+        out["jet_label"][i] = np.array([
+            data["label_QCD"][i], data["label_Hbb"][i], data["label_Hcc"][i],
+            data["label_Hgg"][i], data["label_H4q"][i], data["label_Hqql"][i],
+            data["label_Zqq"][i], data["label_Wqq"][i], data["label_Tbqq"][i],
+            data["label_Tbl"][i]
+        ], dtype=np.int16)
+
+        if add_beams:
+            out["Pmu"][i, -nbeam:, :] = beam_vec
+            out["label"][i, -nbeam:] = -1
+            out["atom_mask"][i, -nbeam:] = True
+
+        if dot_products:
+            out["dots"][i] = dots(out["Pmu"][i], out["Pmu"][i])
     return out
 
 
-##########################################
-# HDF5 file handling                     #
-##########################################
+# ================================
+# HDF5 handling
+# ================================
 
 def create_resizable_h5(output_file, keys, data_shapes, dtypes):
-    """Creates an HDF5 file with resizable datasets."""
     f = h5py.File(output_file, "w")
-    datasets = {
-        key: f.create_dataset(key, shape=data_shapes[key], maxshape=(None,) + data_shapes[key][1:], dtype=dtypes[key],
-                              compression="gzip") for key in keys}
-    return f, datasets
-
+    dsets = {
+        key: f.create_dataset(
+            key, shape=data_shapes[key], maxshape=(None,) + data_shapes[key][1:],
+            dtype=dtypes[key], compression="gzip"
+        ) for key in keys
+    }
+    return f, dsets
 
 def append_to_dataset(dset, data):
-    """Appends data to an HDF5 dataset."""
     current_size = dset.shape[0]
-    new_size = current_size + data.shape[0]
-    dset.resize((new_size,) + dset.shape[1:])
-    dset[current_size:new_size] = data
+    dset.resize(current_size + data.shape[0], axis=0)
+    dset[current_size:] = data
 
 
-##########################################
-# Main program for data conversion       #
-##########################################
+# ================================
+# Main conversion function
+# ================================
 
 def main():
-    root_folder = "./JetClass_Pythia_train_100M_part0"
+    root_folder = "../Data"
+    output_dir = "./Data"
+    os.makedirs(output_dir, exist_ok=True)
+
     root_files = glob.glob(os.path.join(root_folder, "*.root"))
+    if not root_files:
+        raise RuntimeError("No ROOT files found.")
 
-    # Determine global fixed_nvectors across all files
+    # Determine maximum number of particles across all files
     global_nvectors = max(
-        int(np.max(uproot.open(rf)["tree"]["jet_nparticles"].array(library="np"))) for rf in root_files)
+        int(np.max(uproot.open(rf)["tree"]["jet_nparticles"].array(library="np")))
+        for rf in root_files
+    )
+    print(f"Max number of particles per jet: {global_nvectors}")
 
-    print(f"Global fixed number of nodes (nvectors): {global_nvectors}")
+    # Determine smallest event count across all files for balanced splitting
+    min_events = min(
+        len(uproot.open(rf)["tree"]["jet_nparticles"].array(library="np"))
+        for rf in root_files
+    )
+    print(f"Minimum number of events per file: {min_events}")
 
-    # Create resizable HDF5 files
-    os.makedirs("./Data", exist_ok=True)
-    train_file, train_dsets = create_resizable_h5("./Data/train.h5", {}, {}, {})
+    # Create template for dataset shapes and dtypes
+    temp = convert_root_to_dict(root_files[0], global_nvectors)
+    keys = list(temp.keys())
+    shapes = {k: (0,) + temp[k].shape[1:] for k in keys}
+    dtypes = {k: temp[k].dtype for k in keys}
 
+    # Create HDF5 files
+    train_f, train_dsets = create_resizable_h5(os.path.join(output_dir, "train.h5"), keys, shapes, dtypes)
+    val_f, val_dsets     = create_resizable_h5(os.path.join(output_dir, "val.h5"), keys, shapes, dtypes)
+    test_f, test_dsets   = create_resizable_h5(os.path.join(output_dir, "test.h5"), keys, shapes, dtypes)
+
+    # Process each file and write split
     for rf in root_files:
         print(f"Processing file: {rf}")
-        out = convert_root_to_dict(rf, fixed_nvectors=global_nvectors)
-        append_to_dataset(train_dsets["Nobj"], out["Nobj"])
+        data = convert_root_to_dict(rf, global_nvectors)
+        idx = np.arange(data["Nobj"].shape[0])
+        np.random.shuffle(idx)
+        idx = np.sort(idx[:min_events])
+        n_train, n_val = int(min_events * 0.8), int(min_events * 0.1)
+        n_test = min_events - n_train - n_val
 
-    print("Data successfully saved in HDF5 format.")
+        train_idx = idx[:n_train]
+        val_idx = idx[n_train:n_train + n_val]
+        test_idx = idx[n_train + n_val:]
+
+        for k in keys:
+            append_to_dataset(train_dsets[k], data[k][train_idx])
+            append_to_dataset(val_dsets[k],  data[k][val_idx])
+            append_to_dataset(test_dsets[k], data[k][test_idx])
+
+    train_f.close()
+    val_f.close()
+    test_f.close()
+    print("✅ All files converted and saved successfully.")
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     start = time.time()
     main()
     print(f"Total processing time: {time.time() - start:.2f} seconds")

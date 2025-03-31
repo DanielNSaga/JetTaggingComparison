@@ -1,30 +1,3 @@
-"""
-dataset.py
-
-This module defines a PyTorch-compatible dataset class for loading padded particle-level
-data from HDF5 files created for jet tagging tasks (e.g., ParticleNet).
-
-It supports:
-- Static loading (entire file loaded into memory)
-- Streaming mode (per-sample reading, lower memory usage)
-- Flexible feature selection (particle coordinates, energies, etc.)
-- Output formatting (channel_first or channel_last)
-
-Expected HDF5 structure:
-- Each dataset contains:
-    - Feature arrays (e.g., part_pt, part_eta, part_phi, part_energy)
-    - Labels: one-hot or integer labels under the key "label" (default)
-
-Typical output per sample:
-{
-    "X": {
-        "points": (pad_len, 3) or (3, pad_len),
-        "features": (pad_len, C) or (C, pad_len)
-    },
-    "y": label
-}
-"""
-
 import os
 import glob
 import logging
@@ -36,13 +9,12 @@ from torch.utils.data import Dataset as TorchDataset
 # Setup logging
 logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(levelname)s: %(message)s')
 
-
 def pad_array(a, maxlen, value=0., dtype='float32'):
     """
     Pads each row of a list of arrays to a fixed length.
 
     Args:
-        a (list of arrays): Array per event (e.g., particle list).
+        a (list of arrays]): Array per event (e.g., particle list).
         maxlen (int): Maximum number of entries per event.
         value (float): Padding value.
         dtype (str): Output dtype.
@@ -68,12 +40,12 @@ class H5Dataset(TorchDataset):
 
     Args:
         filepath (str): Path to HDF5 file.
-        feature_dict (dict): Keys are feature groups (e.g. 'points', 'features').
+        feature_dict (dict): Keys are 'points', 'features' (or any grouping name).
                              Values are lists of HDF5 keys to include.
-        label (str): Name of the label key in the file.
+        label (str): Name of the label dataset in the file.
         pad_len (int): Number of particles per event after padding.
         data_format (str): 'channel_first' or 'channel_last'.
-        stream (bool): Whether to stream data on __getitem__ or load into memory.
+        stream (bool): Whether to stream data on __getitem__ or load everything into memory.
     """
     def __init__(self, filepath, feature_dict=None, label='label', pad_len=128,
                  data_format='channel_last', stream=False):
@@ -81,18 +53,39 @@ class H5Dataset(TorchDataset):
         self.label = label
         self.pad_len = pad_len
         self._stream = stream
+        # Hvis 'channel_first', stackes kolonner på axis=1; ellers axis=-1
         self.stack_axis = 1 if data_format == 'channel_first' else -1
 
+        # -- Juster feature_dict til de nye kolonne-navnene i HDF5 --
         if feature_dict is None:
+            # Eksempel: "points" inneholder kun (delta_eta, delta_phi),
+            # mens "features" inneholder resterende
             feature_dict = {
-                'points': ['part_eta', 'part_phi', 'part_pt'],
-                'features': ['part_pt', 'part_eta', 'part_phi', 'part_energy']
+                "points": [
+                    "part_delta_eta",
+                    "part_delta_phi"
+                ],
+                "features": [
+                    "part_log_pt",
+                    "part_log_energy",
+                    "part_log_ptrel",
+                    "part_log_Erel",
+                    "part_deltaR",
+                    "part_charge",
+                    "part_isElectron",
+                    "part_isMuon",
+                    "part_isChargedHadron",
+                    "part_isNeutralHadron",
+                    "part_isPhoton"
+                ]
             }
         self.feature_dict = feature_dict
 
+        # Last alt til minne (om stream=False)
         if not self._stream:
             logging.info(f'Loading entire file into memory: {self.filepath}')
             with h5py.File(self.filepath, "r") as f:
+                # Les inn label (eks. one-hot vektor)
                 self._label = f[self.label][:]
                 self._values = {}
                 for key, cols in self.feature_dict.items():
@@ -101,21 +94,24 @@ class H5Dataset(TorchDataset):
                     arrs = []
                     for col in cols:
                         data = f[col][:]
-                        padded = pad_array(data, self.pad_len)
-                        arrs.append(padded)
+                        arrs.append(data)
+                    # Stack arrays langs stack_axis
                     self._values[key] = np.stack(arrs, axis=self.stack_axis)
             logging.info(f'Finished loading {self.filepath}')
+            self._length = len(self._label)
         else:
+            # Hvis stream=True, hentes data fra fil for hvert __getitem__
             with h5py.File(self.filepath, "r") as f:
                 self._length = f[self.label].shape[0]
             self._label = None
             self._values = None
 
     def __len__(self):
-        return self._length if self._stream else len(self._label)
+        return self._length
 
     def __getitem__(self, index):
         if self._stream:
+            # Lese data fra fil hver gang
             with h5py.File(self.filepath, "r") as f:
                 sample = {}
                 sample_label = f[self.label][index]
@@ -124,14 +120,21 @@ class H5Dataset(TorchDataset):
                         cols = [cols]
                     arrs = []
                     for col in cols:
+                        # col er en str, f.eks. "part_delta_eta"
+                        # -> f[col] har shape (N, P)
+                        # -> Vi henter rad for "index"
                         raw = f[col][index]
-                        padded = pad_array([raw], self.pad_len)[0]
-                        arrs.append(padded)
+                        # raw har shape (P,), vil si 1 event
+                        # Om du ønsker å "padde" kan du kalle pad_array
+                        # Forutsatt at P == pad_len, kan du bare bruke raw
+                        arrs.append(raw)
                     sample[key] = np.stack(arrs, axis=self.stack_axis)
                 return {"X": sample, "y": sample_label}
         else:
+            # Hent data direkte fra minne
             sample = {key: self._values[key][index] for key in self._values}
-            return {"X": sample, "y": self._label[index]}
+            sample_label = self._label[index]
+            return {"X": sample, "y": sample_label}
 
 
 def get_datasets(train_path, val_path, test_path, **kwargs):
