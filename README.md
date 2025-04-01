@@ -2,7 +2,7 @@
 
 This repository provides a complete pipeline for comparing two deep learning models — **ParticleNet** and **LorentzNet** — on jet classification using simulated collider data.
 
-The models are trained on a subset of the [JetClass dataset](https://arxiv.org/abs/2206.11898), which contains 100 million jets generated from various Standard Model processes. For this project, we use a curated subset of **10 million jets** (1 million per class) to enable faster training while preserving class balance and physics diversity.
+The models are trained on a subset of the [JetClass dataset](https://paperswithcode.com/dataset/jetclass), which contains 100 million jets generated from various Standard Model processes. For this project, we use a curated subset of **10 million jets** (1 million per class) to enable faster training while preserving class balance and physics diversity.
 
 ---
 
