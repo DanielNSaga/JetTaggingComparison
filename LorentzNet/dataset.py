@@ -119,7 +119,7 @@ class H5Dataset(Dataset):
         return label, p4s, scalars, atom_mask
 
 
-def retrieve_dataloaders(batch_size, data_dir="./Data", num_workers=4, load_to_ram=False):
+def retrieve_dataloaders(batch_size, data_dir="./Data", num_workers=4, load_to_ram=False, pin_memory=True):
     """
     Creates DataLoaders for training, validation, and testing from HDF5 files.
 

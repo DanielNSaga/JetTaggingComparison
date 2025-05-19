@@ -11,7 +11,7 @@ for use in machine learning pipelines such as ParticleNet. It performs the follo
    - charge and particle type (electron, muon, etc.)
 3. Pads jagged arrays to fixed-size particle tensors (N x MAX_PARTICLES).
 4. Splits each file into train/val/test subsets with consistent size across files.
-5. Saves the resulting data to compressed HDF5 files in `ParticleNet/Data`.
+5. Saves the resulting data to compressed HDF5 files in ParticleNet/Data.
 
 Author: [Your Name]
 """

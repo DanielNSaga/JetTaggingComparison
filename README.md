@@ -1,165 +1,77 @@
-# Jet Tagging with ParticleNet and LorentzNet
+# Jet Tagging med CNN, ParticleNet og LorentzNet
 
-This repository provides a complete pipeline for comparing two deep learning models — **ParticleNet** and **LorentzNet** — on jet classification using simulated collider data.
+## Oversikt
+Dette repositoriet gir en komplett pipeline for trening og evaluering av tre forskjellige jet-tagging-modeller innen høyenergifysikk:
+- **CNN (Convolutional Neural Network)**  
+- **ParticleNet (Grafbasert modell)**  
+- **LorentzNet (Lorentz-ekvariant modell)**  
 
-The models are trained on a subset of the [JetClass dataset](https://paperswithcode.com/dataset/jetclass), which contains 100 million jets generated from various Standard Model processes. For this project, we use a curated subset of **10 million jets** (1 million per class) to enable faster training while preserving class balance and physics diversity.
-
----
-
-## Dataset Details
-
-The original JetClass dataset contains labeled jets from 10 classes:
-- QCD
-- H→bb, H→cc, H→gg, H→4q, H→qqℓ
-- Z→qq, W→qq
-- Top→bqq, Top→bl
-
-Each jet contains a variable number of particles (up to ~200). The dataset is stored in `.root` files, one per class. Each particle has information such as 4-momentum, charge, and particle ID flags.
-
-We preprocess the ROOT files and store them in `.h5` format with padding to a fixed number of particles per jet (128). Padding is done per event, and particle-level features are normalized or log-transformed when relevant.
+Hver modell har sin egen mappe med skript for datakonvertering, trening og evaluering. Dette gir fleksibilitet og modularitet i eksperimenteringen med hver arkitektur.
 
 ---
 
-## Workflow
+## Installasjon
 
-1. **Download the data**
+1. **Klone repositoriet:**  
+   git clone https://github.com/DanielNSaga/JetTaggingComparison  
+   
 
-   Run the following script to download the ROOT files (10M jets total):
-   ```bash
-   python download_files.py
-   ```
-
-2. **Convert ROOT files to HDF5**
-
-   This step converts variable-length particle arrays to fixed-size tensors, computes derived features, and saves data to `train.h5`, `val.h5`, and `test.h5`.
-
-   Choose either format depending on the model:
-   ```bash
-   python ParticleNet/convert_file.py
-   ```
-   or
-   ```bash
-   python LorentzNet/convert_file.py
-   ```
-
-3. **Train a model**
-
-   Once data is prepared, start training:
-   ```bash
-   python ParticleNet/trainer.py
-   ```
-   or
-   ```bash
-   python LorentzNet/trainer.py
-   ```
-
-   Both models support logging to TensorBoard, learning rate scheduling with warmup, and automatic model checkpointing.
+2. **Installer nødvendige pakker:**  
+   pip install -r requirements.txt  
 
 ---
 
-## ParticleNet vs. LorentzNet
+## Forberedelse av data
 
-| Feature                | ParticleNet                        | LorentzNet                        |
-|------------------------|-------------------------------------|-----------------------------------|
-| Input format           | Point cloud + per-particle features | 4-vectors + scalar features       |
-| Physics priors         | No explicit symmetry                | Lorentz-invariant by construction |
-| Architecture           | EdgeConv graph network              | LGEB (Lorentz group equivariant)  |
-| Padding                | 128 particles per jet               | 128 particles per jet             |
-| Streaming option       | Yes (`stream=True`)                 | Yes (`load_to_ram=True`)          |
-| Training time (10M)    | ~4.6 hours                          | ~17 hours                         |
-| Accuracy (test set)    | ~70.4%                              | ~73.9%                            |
+### 1. Last ned ROOT-filer  
+Før du konverterer data for hver modell, må de nødvendige ROOT-filene lastes ned.
 
-**ParticleNet** is a performant general-purpose point cloud classifier that operates on local particle neighborhoods. It supports efficient on-disk streaming (`stream=True`), which is helpful when dealing with large datasets.
+- Kjør følgende skript for å laste ned ROOT-filene:  
+  python download_files.py  
 
-**LorentzNet** explicitly models the symmetry structure of particle physics by using Lorentz-invariant operations. It can load the full dataset into memory (`load_to_ram=True`), which improves performance at the cost of higher RAM usage.
+- Dette vil laste ned de nødvendige dataene i en standardmappe.
 
 ---
 
-## Configuration Overview
+## Data Konvertering og Trening
 
-### ParticleNet (config.py)
+### 1. Velg modellen du ønsker å trene:  
+- Gå inn i mappen for den aktuelle modellen:  
+  - For CNN:  
+    cd CNN  
+  - For ParticleNet:  
+    cd ParticleNet  
+  - For LorentzNet:  
+    cd LorentzNet  
 
-```python
-input_dims = 11
-pad_len = 128
-num_classes = 10
-batch_size = 64
-epochs = 10
-lr = 1e-3
-min_lr = 1e-5
-weight_decay = 1e-4
-warmup_epochs = 5
-patience = 3
-stream = True                 # Load batches from disk dynamically
-data_format = "channel_last" # Shape: (batch, particles, features)
-```
+### 2. Konverter ROOT-filene til HDF5:  
+- Kjør convert_file.py i den valgte mappen for å konvertere dataene:  
+  python convert_file.py  
 
-### LorentzNet (config.py)
+- Dette vil generere trenings-, validerings- og testsett i HDF5-format, spesifikt tilpasset modellen.
 
-```python
-n_scalar = 7
-n_hidden = 128
-n_layers = 6
-dropout = 0.0
-c_weight = 1e-3
-batch_size = 64
-epochs = 10
-lr = 1e-3
-min_lr = 1e-5
-weight_decay = 1e-4
-warmup_epochs = 5
-patience = 3
-load_to_ram = False           # If True entire dataset is loaded into memory
-scheduler_type = "warmup_cosine"
-```
+### 3. Tren modellen:  
+- Når konverteringen er fullført, kan du trene modellen med:  
+  python trainer.py  
+
+- Treningen logger progresjon, tap og nøyaktighet, og lagrer den beste modellen automatisk.
 
 ---
 
-## Project Structure
-
-```
-.
-├── Data/                    # Shared preprocessed HDF5 dataset
-├── ParticleNet/
-│   ├── convert_file.py      # ROOT → HDF5 conversion
-│   ├── trainer.py           # Training loop
-│   ├── model.py, config.py, ...
-├── LorentzNet/
-│   ├── convert_file.py
-│   ├── trainer.py
-│   ├── model.py, config.py, ...
-├── download_files.py        # Downloads JetClass subset
-├── requirements.txt         # Python dependencies
-└── README.md
-```
+## Mappeoversikt
+- **/CNN** - Inneholder kode og data for CNN-modellen.  
+- **/ParticleNet** - Inneholder kode og data for ParticleNet-modellen.  
+- **/LorentzNet** - Inneholder kode og data for LorentzNet-modellen.  
+- **download_files.py** - Skript for å laste ned de nødvendige ROOT-filene.  
+- **requirements.txt** - Liste over nødvendige Python-pakker.  
 
 ---
 
-## Installation
-
-To install the required Python packages:
-
-```bash
-pip install -r requirements.txt
-```
-
-This installs:
-- PyTorch
-- NumPy, h5py
-- uproot (for reading ROOT files)
-- matplotlib, seaborn
-- scikit-learn
-- tqdm
-- JAX (used optionally for Lorentz-invariant calculations)
+## Viktig: Kun for CUDA-kompatible GPUer
+Dette repositoriet krever en NVIDIA GPU med CUDA-støtte for å kunne trene modellene effektivt. CPU-trening er ikke støttet, og andre GPU-typer (f.eks. AMD) støttes ikke uten omfattende modifikasjoner.
 
 ---
 
-## Reproducibility
 
-Both models use a `Config` class to manage all training hyperparameters and data paths. Each run saves its full configuration to disk (JSON), ensuring reproducibility and traceability across experiments.
-
----
-
-## License
-
-This project is licensed under the MIT License.
+## Lisens
+Dette repositoriet er lisensiert under MIT-lisensen. Se LICENSE-filen for detaljer.

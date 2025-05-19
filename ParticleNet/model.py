@@ -1,5 +1,4 @@
 """
-particle_net.py
 
 This module defines the full implementation of ParticleNet, a neural network
 architecture designed for jet tagging tasks using particle cloud representations.

@@ -81,7 +81,6 @@ class H5Dataset(TorchDataset):
             }
         self.feature_dict = feature_dict
 
-        # Last alt til minne (om stream=False)
         if not self._stream:
             logging.info(f'Loading entire file into memory: {self.filepath}')
             with h5py.File(self.filepath, "r") as f:
@@ -95,12 +94,10 @@ class H5Dataset(TorchDataset):
                     for col in cols:
                         data = f[col][:]
                         arrs.append(data)
-                    # Stack arrays langs stack_axis
                     self._values[key] = np.stack(arrs, axis=self.stack_axis)
             logging.info(f'Finished loading {self.filepath}')
             self._length = len(self._label)
         else:
-            # Hvis stream=True, hentes data fra fil for hvert __getitem__
             with h5py.File(self.filepath, "r") as f:
                 self._length = f[self.label].shape[0]
             self._label = None
@@ -111,7 +108,6 @@ class H5Dataset(TorchDataset):
 
     def __getitem__(self, index):
         if self._stream:
-            # Lese data fra fil hver gang
             with h5py.File(self.filepath, "r") as f:
                 sample = {}
                 sample_label = f[self.label][index]
@@ -120,18 +116,11 @@ class H5Dataset(TorchDataset):
                         cols = [cols]
                     arrs = []
                     for col in cols:
-                        # col er en str, f.eks. "part_delta_eta"
-                        # -> f[col] har shape (N, P)
-                        # -> Vi henter rad for "index"
                         raw = f[col][index]
-                        # raw har shape (P,), vil si 1 event
-                        # Om du ønsker å "padde" kan du kalle pad_array
-                        # Forutsatt at P == pad_len, kan du bare bruke raw
                         arrs.append(raw)
                     sample[key] = np.stack(arrs, axis=self.stack_axis)
                 return {"X": sample, "y": sample_label}
         else:
-            # Hent data direkte fra minne
             sample = {key: self._values[key][index] for key in self._values}
             sample_label = self._label[index]
             return {"X": sample, "y": sample_label}
